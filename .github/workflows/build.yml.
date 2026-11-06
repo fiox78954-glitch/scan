@@ -1,0 +1,179 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate project
+        run: |
+          mkdir -p app/src/main/java/com/example/irscan
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "IrScan"
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.example.irscan'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.example.irscan'
+                  minSdk 21
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.TRANSMIT_IR"/>
+              <application android:label="IR Scan">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/example/irscan/MainActivity.kt <<'EOF'
+          package com.example.irscan
+
+          import android.app.Activity
+          import android.content.Context
+          import android.hardware.ConsumerIrManager
+          import android.os.Bundle
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+
+              @Volatile private var running = false
+              private lateinit var status: TextView
+              private var ir: ConsumerIrManager? = null
+
+              private val commands = intArrayOf(
+                  0x08, 0x12, 0x0C, 0x40, 0x1C, 0x02, 0x45, 0x46, 0x00, 0x01,
+                  0x10, 0x14, 0x15, 0x18, 0x1A, 0x4D, 0x5C, 0x0A, 0x0D, 0x0F
+              )
+
+              private val priorityAddr = intArrayOf(0x00, 0x04, 0x01, 0x02, 0x08, 0x10, 0x20, 0x40, 0x80, 0x18, 0x1C, 0x7F)
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  ir = getSystemService(Context.CONSUMER_IR_SERVICE) as? ConsumerIrManager
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(40, 120, 40, 40)
+                  }
+                  status = TextView(this).apply { textSize = 18f; text = "Готов" }
+                  val start = Button(this).apply { text = "Старт перебора" }
+                  val stop = Button(this).apply { text = "Стоп (телевизор включился)" }
+                  root.addView(status); root.addView(start); root.addView(stop)
+                  setContentView(root)
+
+                  if (ir == null || ir?.hasIrEmitter() != true) {
+                      status.text = "ИК-порта на этом телефоне нет"
+                      return
+                  }
+
+                  start.setOnClickListener {
+                      if (running) return@setOnClickListener
+                      running = true
+                      Thread { scan() }.start()
+                  }
+                  stop.setOnClickListener { running = false }
+              }
+
+              private fun scan() {
+                  val addrs = priorityAddr.toList() + (0..255).filter { it !in priorityAddr }
+                  val last = ArrayList<String>()
+                  for (a in addrs) {
+                      for (c in commands) {
+                          if (!running) return
+                          ir?.transmit(38000, nec(a, c))
+                          last.add(String.format("адрес 0x%02X, команда 0x%02X", a, c))
+                          if (last.size > 3) last.removeAt(0)
+                          val text = "Отправлено:\n" + last.joinToString("\n")
+                          runOnUiThread { status.text = text }
+                          Thread.sleep(300)
+                      }
+                  }
+                  running = false
+                  runOnUiThread { status.text = "Перебор закончен, телевизор не отреагировал" }
+              }
+
+              private fun nec(addr: Int, cmd: Int): IntArray {
+                  val p = ArrayList<Int>()
+                  p.add(9000); p.add(4500)
+                  val bytes = intArrayOf(addr, addr.inv() and 0xFF, cmd, cmd.inv() and 0xFF)
+                  for (b in bytes) {
+                      for (i in 0..7) {
+                          p.add(560)
+                          p.add(if (((b shr i) and 1) == 1) 1690 else 560)
+                      }
+                  }
+                  p.add(560)
+                  return p.toIntArray()
+              }
+          }
+          EOF
+
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+
+      - name: Publish APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "apk-${{ github.run_number }}" \
+            app/build/outputs/apk/debug/app-debug.apk \
+            --title "IR Scan" --notes "Debug AP
