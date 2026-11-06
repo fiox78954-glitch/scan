@@ -1,0 +1,88 @@
+package com.example.irscan
+
+import android.app.Activity
+import android.content.Context
+import android.hardware.ConsumerIrManager
+import android.os.Bundle
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
+
+// В AndroidManifest.xml добавить:
+// <uses-permission android:name="android.permission.TRANSMIT_IR"/>
+
+class MainActivity : Activity() {
+
+    @Volatile private var running = false
+    private lateinit var status: TextView
+    private var ir: ConsumerIrManager? = null
+
+    // Частые команды питания в протоколе NEC
+    private val commands = intArrayOf(
+        0x08, 0x12, 0x0C, 0x40, 0x1C, 0x02, 0x45, 0x46, 0x00, 0x01,
+        0x10, 0x14, 0x15, 0x18, 0x1A, 0x4D, 0x5C, 0x0A, 0x0D, 0x0F
+    )
+
+    // Сначала частые адреса, потом все остальные
+    private val priorityAddr = intArrayOf(0x00, 0x04, 0x01, 0x02, 0x08, 0x10, 0x20, 0x40, 0x80, 0x18, 0x1C, 0x7F)
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        ir = getSystemService(Context.CONSUMER_IR_SERVICE) as? ConsumerIrManager
+
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(40, 80, 40, 40)
+        }
+        status = TextView(this).apply { textSize = 18f; text = "Готов" }
+        val start = Button(this).apply { text = "Старт перебора" }
+        val stop = Button(this).apply { text = "Стоп (телевизор включился)" }
+        root.addView(status); root.addView(start); root.addView(stop)
+        setContentView(root)
+
+        if (ir == null || ir?.hasIrEmitter() != true) {
+            status.text = "ИК-порта на этом телефоне нет"
+            return
+        }
+
+        start.setOnClickListener {
+            if (running) return@setOnClickListener
+            running = true
+            Thread { scan() }.start()
+        }
+        stop.setOnClickListener { running = false }
+    }
+
+    private fun scan() {
+        val addrs = priorityAddr.toList() + (0..255).filter { it !in priorityAddr }
+        val last = ArrayDeque<String>()
+        for (a in addrs) {
+            for (c in commands) {
+                if (!running) return
+                ir?.transmit(38000, nec(a, c))
+                last.addLast(String.format("адрес 0x%02X, команда 0x%02X", a, c))
+                if (last.size > 3) last.removeFirst()
+                val text = "Отправлено:\n" + last.joinToString("\n")
+                runOnUiThread { status.text = text }
+                Thread.sleep(300)
+            }
+        }
+        running = false
+        runOnUiThread { status.text = "Перебор закончен, телевизор не отреагировал" }
+    }
+
+    // NEC: заголовок 9000/4500 мкс, биты LSB first, адрес + ~адрес + команда + ~команда
+    private fun nec(addr: Int, cmd: Int): IntArray {
+        val p = ArrayList<Int>()
+        p.add(9000); p.add(4500)
+        val bytes = intArrayOf(addr, addr.inv() and 0xFF, cmd, cmd.inv() and 0xFF)
+        for (b in bytes) {
+            for (i in 0..7) {
+                p.add(560)
+                p.add(if (((b shr i) and 1) == 1) 1690 else 560)
+            }
+        }
+        p.add(560)
+        return p.toIntArray()
+    }
+}
